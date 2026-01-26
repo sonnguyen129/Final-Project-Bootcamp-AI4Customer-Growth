@@ -1,0 +1,31 @@
+# =============================================================================
+# Customer Churn & CLV API - Requirements
+# =============================================================================
+
+# Core Data Science
+pandas>=1.5.0
+numpy>=1.24.0
+scikit-learn>=1.2.0
+
+# Probabilistic Models
+lifetimes>=0.11.0
+lifelines>=0.27.0
+
+# Serialization (for lifetimes models with lambda functions)
+dill>=0.3.6
+
+# API Framework
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+
+# Visualization (for notebook)
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Utilities
+python-dateutil>=2.8.0
+
+# Development (optional)
+jupyter>=1.0.0
+ipykernel>=6.0.0
