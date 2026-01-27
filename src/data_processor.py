@@ -28,6 +28,9 @@ class DataProcessor:
     """
     
     DEFAULT_DATA_DIR = "data"
+    # Default observation date for the snapshot (when API is called)
+    # This should match the data snapshot date for consistent predictions
+    DEFAULT_OBSERVATION_DATE = "2026-01-01"
     
     def __init__(self, data_dir: Optional[str] = None, observation_date: Optional[pd.Timestamp] = None):
         """
@@ -38,7 +41,7 @@ class DataProcessor:
         data_dir : str, optional
             Directory containing CSV files. Defaults to 'data' in project root.
         observation_date : pd.Timestamp, optional
-            Reference date for feature calculation. Defaults to today.
+            Reference date for feature calculation. Defaults to 2026-01-01.
         """
         if data_dir is None:
             # Try to find data directory relative to this file
@@ -46,7 +49,7 @@ class DataProcessor:
             data_dir = current_dir.parent / self.DEFAULT_DATA_DIR
         
         self.data_dir = Path(data_dir)
-        self.observation_date = observation_date or pd.Timestamp.now()
+        self.observation_date = observation_date or pd.Timestamp(self.DEFAULT_OBSERVATION_DATE)
         
         # Data storage
         self.customers: Optional[pd.DataFrame] = None
@@ -105,7 +108,7 @@ class DataProcessor:
         self.feature_engineer = ChurnFeatureEngineer(
             observation_date=self.observation_date,
             horizon=60,
-            historical_window=365,  # Use 1 year of history for features
+            historical_window=90,
             verbose=False
         )
         
@@ -125,6 +128,28 @@ class DataProcessor:
         if self.customers is None:
             return False
         return customer_id in self.customers['customer_id'].values
+    
+    def is_customer_active(self, customer_id: str) -> bool:
+        """
+        Check if a customer is active (has pre-computed features).
+        
+        A customer is considered "active" if they have transactions within
+        the historical window AND their recency < horizon (60 days).
+        
+        Customers who are NOT active are considered "already churned".
+        
+        Parameters:
+        -----------
+        customer_id : str
+            Customer ID
+            
+        Returns:
+        --------
+        True if customer has pre-computed features (is active), False otherwise
+        """
+        if self.all_features is None:
+            return False
+        return (self.all_features['customer_id'] == customer_id).any()
     
     def get_customer_info(self, customer_id: str) -> Optional[pd.Series]:
         """
@@ -216,6 +241,105 @@ class DataProcessor:
             'transaction_count': int(len(customer_txns))
         }
     
+    def compute_cox_features_onthefly(self, customer_id: str) -> Optional[pd.DataFrame]:
+        """
+        Compute Cox PH model features on-the-fly from transactions.
+        
+        This method calculates all 9 features needed for Cox PH model directly
+        from transaction data, without requiring pre-computed features.
+        
+        Features computed:
+        - recency, frequency, monetary (RFM basic)
+        - RFM_score, purchase_frequency_rate, cv_spending (RFM derived)
+        - recent_30d_frequency, frequency_trend, is_declining (trend features)
+        
+        Parameters:
+        -----------
+        customer_id : str
+            Customer ID
+            
+        Returns:
+        --------
+        DataFrame with Cox features for the customer (single row)
+        """
+        customer_txns = self.get_customer_transactions(customer_id)
+        
+        if len(customer_txns) == 0:
+            return None
+        
+        # Sort by date
+        customer_txns = customer_txns.sort_values('transaction_date')
+        
+        # === Basic RFM ===
+        first_purchase = customer_txns['transaction_date'].min()
+        last_purchase = customer_txns['transaction_date'].max()
+        
+        # Recency: days from last purchase to observation date
+        recency = (self.observation_date - last_purchase).days
+        
+        # Frequency: number of repeat purchases
+        frequency = max(0, len(customer_txns) - 1)
+        
+        # Monetary: average transaction value
+        monetary = customer_txns['amount'].mean()
+        
+        # Customer age
+        customer_age_days = (self.observation_date - first_purchase).days
+        
+        # === RFM Derived ===
+        # Purchase frequency rate
+        purchase_frequency_rate = frequency / (customer_age_days + 1)
+        
+        # CV spending (coefficient of variation)
+        std_transaction = customer_txns['amount'].std() if len(customer_txns) > 1 else 0
+        cv_spending = std_transaction / (monetary + 1e-6)
+        
+        # RFM Score (simplified - use quantile-based scoring)
+        # For single customer, use simple thresholds
+        r_score = 5 if recency < 15 else (4 if recency < 30 else (3 if recency < 60 else (2 if recency < 90 else 1)))
+        f_score = 5 if frequency >= 10 else (4 if frequency >= 5 else (3 if frequency >= 3 else (2 if frequency >= 1 else 1)))
+        m_score = 5 if monetary >= 100 else (4 if monetary >= 50 else (3 if monetary >= 25 else (2 if monetary >= 10 else 1)))
+        RFM_score = r_score + f_score + m_score
+        
+        # === Trend Features ===
+        cutoff_recent = self.observation_date - pd.Timedelta(days=30)
+        cutoff_previous = cutoff_recent - pd.Timedelta(days=30)
+        
+        # Recent 30 days
+        recent_txns = customer_txns[
+            (customer_txns['transaction_date'] >= cutoff_recent) &
+            (customer_txns['transaction_date'] < self.observation_date)
+        ]
+        recent_30d_frequency = len(recent_txns)
+        
+        # Previous 30 days
+        previous_txns = customer_txns[
+            (customer_txns['transaction_date'] >= cutoff_previous) &
+            (customer_txns['transaction_date'] < cutoff_recent)
+        ]
+        previous_30d_frequency = len(previous_txns)
+        
+        # Frequency trend
+        frequency_trend = recent_30d_frequency - previous_30d_frequency
+        
+        # Is declining
+        is_declining = 1 if frequency_trend < 0 else 0
+        
+        # Create DataFrame
+        cox_features = pd.DataFrame({
+            'recency': [float(recency)],
+            'frequency': [float(frequency)],
+            'monetary': [float(monetary)],
+            'RFM_score': [float(RFM_score)],
+            'purchase_frequency_rate': [float(purchase_frequency_rate)],
+            'recent_30d_frequency': [float(recent_30d_frequency)],
+            'frequency_trend': [float(frequency_trend)],
+            'is_declining': [float(is_declining)],
+            'cv_spending': [float(cv_spending)]
+        })
+        
+        return cox_features
+    
     def compute_all_features(self, customer_id: str) -> Optional[pd.DataFrame]:
         """
         Compute all features for a specific customer using ChurnFeatureEngineer.
@@ -228,22 +352,30 @@ class DataProcessor:
         Returns:
         --------
         DataFrame with all features for the customer (single row)
+        
+        IMPORTANT: This method returns a completely independent copy of the data
+        to prevent any mutations from affecting the original cached data.
         """
         # If we have pre-computed features, use them
         if self.all_features is not None:
-            # Always return a deep copy with reset index to avoid mutation issues
-            # and ensure consistent indexing for sklearn operations
-            customer_features = self.all_features[self.all_features['customer_id'] == customer_id].copy(deep=True)
+            # CRITICAL FIX: Use .loc with boolean indexing and create a completely
+            # independent copy to prevent any index or data mutations
+            mask = self.all_features['customer_id'] == customer_id
             
-            if len(customer_features) > 0:
-                # Reset index to ensure consistent 0-based indexing
-                customer_features = customer_features.reset_index(drop=True)
+            if mask.any():
+                # Create a brand new DataFrame from the values to ensure complete isolation
+                # This prevents any index-related issues with sklearn transformers
+                source_data = self.all_features.loc[mask]
+                
+                # Create new DataFrame from dict to ensure no reference to original
+                customer_features = pd.DataFrame(
+                    {col: [source_data[col].iloc[0]] for col in source_data.columns}
+                )
                 return customer_features
         
         # Fallback: customer not found in pre-computed features
         # This might happen nếu customer không có transaction trong observation window
         # Trả về DataFrame với giá trị mặc định để tránh lỗi 500
-        import pandas as pd
         default_features = pd.DataFrame({
             'customer_id': [customer_id],
         })

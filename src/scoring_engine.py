@@ -101,16 +101,25 @@ class ScoringEngine:
             return monetary_value * horizon_months * 0.5  # Fallback
         
         try:
+            # lifetimes library expects pandas Series or arrays, not scalars
+            # Wrap single values in pd.Series with index
+            freq_series = pd.Series([frequency], index=[0])
+            rec_series = pd.Series([recency], index=[0])
+            T_series = pd.Series([T], index=[0])
+            monetary_series = pd.Series([monetary_value], index=[0])
+            
             clv = ggf.customer_lifetime_value(
                 bgf,
-                frequency,
-                recency,
-                T,
-                monetary_value,
+                freq_series,
+                rec_series,
+                T_series,
+                monetary_series,
                 time=horizon_months,
                 discount_rate=self.DISCOUNT_RATE
             )
-            return float(clv) if not np.isnan(clv) else 0.0
+            # Result is a Series, get first value
+            clv_value = float(clv.iloc[0]) if hasattr(clv, 'iloc') else float(clv)
+            return clv_value if not np.isnan(clv_value) else 0.0
         except Exception:
             return monetary_value * horizon_months * 0.5
     
@@ -179,30 +188,48 @@ class ScoringEngine:
         if not self.processor.customer_exists(customer_id):
             return None
         
-        # Compute features on-the-fly
-        customer_features = self.processor.compute_all_features(customer_id)
-        if customer_features is None:
-            return None
-        
-        # Get RFM features
+        # Get RFM features - can be computed for ANY customer with transactions
+        # This does NOT depend on pre-computed features
         rfm_features_dict = self.processor.compute_rfm_features(customer_id)
         if rfm_features_dict is None:
             rfm_features = None
         else:
             rfm_features = pd.Series(rfm_features_dict)
         
-        # 1. Classification-based churn probability
-        churn_prob = self._predict_churn_classification(customer_features)
+        # Check if customer is active (has pre-computed features for classification)
+        is_active = self.processor.is_customer_active(customer_id)
         
-        # 2. BG-NBD P(alive)
+        if is_active:
+            # Customer has pre-computed features - use classification model
+            customer_features = self.processor.compute_all_features(customer_id)
+            
+            # 1. Classification-based churn probability
+            churn_prob = self._predict_churn_classification(customer_features)
+            
+            # 3. Expected remaining lifetime (from Cox PH with pre-computed features)
+            expected_lifetime = self._predict_remaining_lifetime(customer_features)
+            
+            # 4b. CLV survival (needs Cox features)
+            clv_survival = self._calculate_customer_clv_survival(customer_features, rfm_features)
+        else:
+            # Customer is churned (recency >= 60 days) - no pre-computed features
+            # Classification model: use churn_prob = 1.0
+            churn_prob = 1.0
+            
+            # Cox PH: compute features on-the-fly and predict
+            cox_features_df = self.processor.compute_cox_features_onthefly(customer_id)
+            if cox_features_df is not None:
+                expected_lifetime = self._predict_remaining_lifetime_from_cox(cox_features_df)
+                clv_survival = self._calculate_survival_clv_from_cox(cox_features_df, rfm_features)
+            else:
+                expected_lifetime = 0.0
+                clv_survival = 0.0
+        
+        # 2. BG-NBD P(alive) - works with RFM features only
         p_alive = self._predict_p_alive(rfm_features)
         
-        # 3. Expected remaining lifetime (from Cox PH)
-        expected_lifetime = self._predict_remaining_lifetime(customer_features)
-        
-        # 4. CLV calculations
+        # 4a. CLV BG-NBD - works with RFM features only
         clv_bgnbd = self._calculate_customer_clv_bgnbd(rfm_features)
-        clv_survival = self._calculate_customer_clv_survival(customer_features, rfm_features)
         
         return CustomerScore(
             customer_id=customer_id,
@@ -229,16 +256,25 @@ class ScoringEngine:
             if len(available_cols) == 0:
                 return 0.5
             
-            # Prepare features - make a deep copy and ensure clean state
-            X = customer_features[available_cols].copy(deep=True)
-            X = X.reset_index(drop=True)
-            X = X.replace([np.inf, -np.inf], np.nan).fillna(0)
+            # CRITICAL FIX: Extract values directly as numpy array to completely
+            # avoid any pandas index-related issues with sklearn transformers.
+            # This ensures consistent behavior across multiple API calls.
+            feature_values = []
+            for col in available_cols:
+                val = customer_features[col].iloc[0]
+                # Handle inf and nan
+                if pd.isna(val) or np.isinf(val):
+                    val = 0.0
+                feature_values.append(float(val))
             
-            # Apply preprocessing - use .values to avoid index issues with sklearn
+            # Create numpy array with proper shape (1, n_features)
+            X_array = np.array([feature_values], dtype=np.float64)
+            
+            # Apply preprocessing
             if preprocessing is not None:
-                X_scaled = preprocessing.transform(X.values)
+                X_scaled = preprocessing.transform(X_array)
             else:
-                X_scaled = X.values
+                X_scaled = X_array
             
             # Predict
             prob = model.predict_proba(X_scaled)[:, 1]
@@ -262,6 +298,9 @@ class ScoringEngine:
                 rfm_features['recency'],
                 rfm_features['T']
             )
+            # Handle both scalar and array return types
+            if hasattr(p_alive, '__len__'):
+                return float(p_alive[0])
             return float(p_alive)
         except Exception:
             return 0.5
@@ -286,27 +325,129 @@ class ScoringEngine:
             return 180.0  # Default 180 days (~6 months)
         
         try:
-            # Get Cox features - use deep copy and reset index for consistent state
+            # CRITICAL FIX: Build a clean DataFrame from scratch using only values
+            # to avoid any index-related issues with lifelines CoxPHFitter
             available_features = [f for f in cox_features if f in customer_features.columns]
-            X_cox = customer_features[available_features].copy(deep=True)
-            X_cox = X_cox.reset_index(drop=True)
-            X_cox = X_cox.replace([np.inf, -np.inf], np.nan).fillna(0)
+            
+            # Extract values and create fresh DataFrame
+            feature_dict = {}
+            for f in available_features:
+                val = customer_features[f].iloc[0]
+                # Handle inf and nan
+                if pd.isna(val) or np.isinf(val):
+                    val = 0.0
+                feature_dict[f] = [float(val)]
+            
+            X_cox = pd.DataFrame(feature_dict)
             
             # Predict median survival time (in days)
             median_survival = cph.predict_median(X_cox)
             
             # Get customer's current duration
-            duration = customer_features['duration'].values[0] if 'duration' in customer_features.columns else 0
+            duration = 0.0
+            if 'duration' in customer_features.columns:
+                duration = float(customer_features['duration'].iloc[0])
             
             # Calculate expected remaining lifetime (in days)
             # Formula: expected_remaining_lifetime = median_survival_time - duration
-            median_survival_value = float(median_survival.values[0])
+            # Handle both DataFrame and scalar returns from predict_median
+            if hasattr(median_survival, 'values'):
+                median_survival_value = float(median_survival.values[0])
+            elif hasattr(median_survival, '__iter__') and not isinstance(median_survival, (int, float)):
+                median_survival_value = float(median_survival[0])
+            else:
+                median_survival_value = float(median_survival)
             expected_remaining_lifetime = median_survival_value - duration
             
             # Clip at 0 (cannot have negative remaining lifetime)
             return max(0.0, expected_remaining_lifetime)
         except Exception:
             return 180.0  # Default 180 days
+    
+    def _predict_remaining_lifetime_from_cox(self, cox_features_df: pd.DataFrame) -> float:
+        """
+        Predict expected remaining lifetime using Cox PH with pre-built Cox features DataFrame.
+        
+        Parameters:
+        -----------
+        cox_features_df : pd.DataFrame
+            DataFrame with Cox features (from compute_cox_features_onthefly)
+            
+        Returns:
+        --------
+        Expected remaining lifetime in days (clipped at 0)
+        """
+        cph = self.loader.cph_model
+        
+        if cph is None or cox_features_df is None or cox_features_df.empty:
+            return 180.0  # Default 180 days
+        
+        try:
+            # Predict median survival time (in days)
+            median_survival = cph.predict_median(cox_features_df)
+            
+            # Handle both DataFrame and scalar returns from predict_median
+            if hasattr(median_survival, 'values'):
+                median_survival_value = float(median_survival.values[0])
+            elif hasattr(median_survival, '__iter__') and not isinstance(median_survival, (int, float)):
+                median_survival_value = float(median_survival[0])
+            else:
+                median_survival_value = float(median_survival)
+            
+            # Clip at 0
+            return max(0.0, median_survival_value)
+        except Exception:
+            return 180.0  # Default 180 days
+    
+    def _calculate_survival_clv_from_cox(
+        self,
+        cox_features_df: pd.DataFrame,
+        rfm_features: Optional[pd.Series]
+    ) -> float:
+        """
+        Calculate CLV using survival approach with pre-built Cox features DataFrame.
+        
+        Parameters:
+        -----------
+        cox_features_df : pd.DataFrame
+            DataFrame with Cox features (from compute_cox_features_onthefly)
+        rfm_features : pd.Series
+            RFM features for expected profit calculation
+            
+        Returns:
+        --------
+        CLV value
+        """
+        cph = self.loader.cph_model
+        ggf = self.loader.ggf_model
+        
+        if rfm_features is None:
+            return 0.0
+        
+        # Get expected profit
+        if ggf is not None and rfm_features['frequency'] > 0:
+            try:
+                expected_profit = ggf.conditional_expected_average_profit(
+                    rfm_features['frequency'],
+                    rfm_features['monetary_value']
+                )
+                expected_profit = float(expected_profit)
+            except Exception:
+                expected_profit = rfm_features.get('monetary_value', 0)
+        else:
+            expected_profit = rfm_features.get('monetary_value', 0)
+        
+        # Estimate monthly purchases
+        T = rfm_features['T']
+        frequency = rfm_features['frequency']
+        monthly_purchases = (frequency + 1) / (T / 30) if T > 0 else 0.5
+        
+        return self._calculate_survival_clv(
+            cox_features_df if cox_features_df is not None else pd.DataFrame(),
+            expected_profit,
+            monthly_purchases,
+            self.DEFAULT_HORIZON_MONTHS
+        )
     
     def _calculate_customer_clv_bgnbd(self, rfm_features: Optional[pd.Series]) -> float:
         """Calculate CLV using BG-NBD + Gamma-Gamma for a customer."""
@@ -352,14 +493,22 @@ class ScoringEngine:
         frequency = rfm_features['frequency']
         monthly_purchases = (frequency + 1) / (T / 30) if T > 0 else 0.5
         
-        # Prepare Cox features - use deep copy and reset index
+        # CRITICAL FIX: Build a clean DataFrame from scratch using only values
+        # to avoid any index-related issues with lifelines CoxPHFitter
+        X_cox = None
         if cph is not None and cox_features is not None:
             available_features = [f for f in cox_features if f in customer_features.columns]
-            X_cox = customer_features[available_features].copy(deep=True)
-            X_cox = X_cox.reset_index(drop=True)
-            X_cox = X_cox.replace([np.inf, -np.inf], np.nan).fillna(0)
-        else:
-            X_cox = None
+            
+            # Extract values and create fresh DataFrame
+            feature_dict = {}
+            for f in available_features:
+                val = customer_features[f].iloc[0]
+                # Handle inf and nan
+                if pd.isna(val) or np.isinf(val):
+                    val = 0.0
+                feature_dict[f] = [float(val)]
+            
+            X_cox = pd.DataFrame(feature_dict)
         
         return self._calculate_survival_clv(
             X_cox if X_cox is not None else pd.DataFrame(),
@@ -387,6 +536,12 @@ class ScoringEngine:
         --------
         Tuple of (probability, label) or None if customer not found
         """
+        # Check if customer is active (has pre-computed features)
+        # If not active, they are considered "already churned" (recency >= 60 days)
+        if not self.processor.is_customer_active(customer_id):
+            # Customer has no recent transactions - already churned
+            return 1.0, ChurnRiskLabel.CRITICAL_RISK
+        
         # Compute features on-the-fly
         customer_features = self.processor.compute_all_features(customer_id)
         if customer_features is None:
@@ -410,6 +565,9 @@ class ScoringEngine:
         """
         Predict survival curve and expected remaining lifetime.
         
+        This method computes Cox PH features on-the-fly for ALL customers
+        with transactions, not just "active" customers.
+        
         Parameters:
         -----------
         customer_id : str
@@ -419,30 +577,32 @@ class ScoringEngine:
         --------
         Tuple of (survival_curve, expected_remaining_lifetime) or None
         """
-        # Compute features on-the-fly
-        customer_features = self.processor.compute_all_features(customer_id)
-        if customer_features is None:
-            return None
-        
         cph = self.loader.cph_model
-        cox_features = self.loader.cox_features
+        cox_feature_names = self.loader.cox_features
         
-        if cph is None or cox_features is None:
+        if cph is None or cox_feature_names is None:
             # Fallback: generate default curve
             default_curve = [
                 SurvivalPoint(day=30, prob=0.85),
                 SurvivalPoint(day=60, prob=0.70),
                 SurvivalPoint(day=90, prob=0.55),
             ]
-            return default_curve, 6.0
+            return default_curve, 180.0
+        
+        # ALWAYS compute Cox features on-the-fly for ALL customers with transactions
+        # This ensures consistent predictions for both active and churned customers
+        X_cox = self.processor.compute_cox_features_onthefly(customer_id)
+        
+        if X_cox is None or X_cox.empty:
+            # Customer has no transactions
+            default_curve = [
+                SurvivalPoint(day=30, prob=0.85),
+                SurvivalPoint(day=60, prob=0.70),
+                SurvivalPoint(day=90, prob=0.55),
+            ]
+            return default_curve, 180.0
         
         try:
-            # Prepare features - use deep copy and reset index
-            available_features = [f for f in cox_features if f in customer_features.columns]
-            X_cox = customer_features[available_features].copy(deep=True)
-            X_cox = X_cox.reset_index(drop=True)
-            X_cox = X_cox.replace([np.inf, -np.inf], np.nan).fillna(0)
-            
             # Generate survival curve
             time_points = [30, 60, 90, 180, 365]
             surv_func = cph.predict_survival_function(X_cox, times=time_points)
@@ -452,18 +612,32 @@ class ScoringEngine:
                 for i, t in enumerate(time_points)
             ]
             
-            # Expected remaining lifetime
-            expected_lifetime = self._predict_remaining_lifetime(customer_features)
+            # Expected remaining lifetime from Cox model
+            median_survival = cph.predict_median(X_cox)
+            
+            # Handle both DataFrame and scalar returns from predict_median
+            if hasattr(median_survival, 'values'):
+                median_survival_value = float(median_survival.values[0])
+            elif hasattr(median_survival, '__iter__') and not isinstance(median_survival, (int, float)):
+                median_survival_value = float(median_survival[0])
+            else:
+                median_survival_value = float(median_survival)
+            
+            # For churned customers, recency is already > 60, so remaining lifetime could be negative
+            # Clip at 0
+            expected_lifetime = max(0.0, median_survival_value)
             
             return survival_curve, expected_lifetime
         except Exception as e:
             print(f"Warning: Survival prediction failed: {e}")
+            import traceback
+            traceback.print_exc()
             default_curve = [
                 SurvivalPoint(day=30, prob=0.85),
                 SurvivalPoint(day=60, prob=0.70),
                 SurvivalPoint(day=90, prob=0.55),
             ]
-            return default_curve, 6.0
+            return default_curve, 180.0
     
     def estimate_clv(
         self, 
@@ -487,11 +661,7 @@ class ScoringEngine:
         --------
         CLV value or None if customer not found
         """
-        # Compute features on-the-fly
-        customer_features = self.processor.compute_all_features(customer_id)
-        if customer_features is None:
-            return None
-        
+        # Get RFM features - can be computed for ANY customer with transactions
         rfm_features_dict = self.processor.compute_rfm_features(customer_id)
         if rfm_features_dict is None:
             rfm_features = None
@@ -499,6 +669,7 @@ class ScoringEngine:
             rfm_features = pd.Series(rfm_features_dict)
         
         if method == CLVMethod.BGNBD:
+            # BG-NBD only needs RFM features - works for ALL customers with transactions
             if rfm_features is None:
                 return 0.0
             return self._calculate_bgnbd_clv(
@@ -509,7 +680,18 @@ class ScoringEngine:
                 horizon_months
             )
         else:  # Survival method
-            return self._calculate_customer_clv_survival(customer_features, rfm_features)
+            # Try pre-computed features first, then on-the-fly
+            if self.processor.is_customer_active(customer_id):
+                customer_features = self.processor.compute_all_features(customer_id)
+                if customer_features is not None:
+                    return self._calculate_customer_clv_survival(customer_features, rfm_features)
+            
+            # Compute Cox features on-the-fly for churned customers
+            cox_features_df = self.processor.compute_cox_features_onthefly(customer_id)
+            if cox_features_df is not None:
+                return self._calculate_survival_clv_from_cox(cox_features_df, rfm_features)
+            
+            return 0.0
     
     def rank_customers_for_retention(
         self,
