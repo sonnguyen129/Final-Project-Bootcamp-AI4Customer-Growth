@@ -514,7 +514,7 @@ uvicorn src.api_service:app --host 127.0.0.1 --port 8000 --reload
 ### 5.1 Kiến trúc tổng quan
 
 <p align="center">
-  <img src="assets/api_architecture.png" width="600">
+  <img src="assets/api_architecture.png" width="1000">
 </p>
 
 ### 5.2 Chi tiết các Endpoints
@@ -591,7 +591,7 @@ uvicorn src.api_service:app --host 127.0.0.1 --port 8000 --reload
 
 **Logic Flow:**
 <p align="center">
-  <img src="assets/score_customer_logic_flow.png" width="600">
+  <img src="assets/score_customer_logic_flow.png" width="1000">
 </p>
 
 ---
@@ -664,7 +664,7 @@ churn_prob = min(1.0, churn_prob * (horizon_days / 60))
 
 **On-the-fly Cox Feature Computation:**
 <p align="center">
-  <img src="assets/cox_feature_computation.png" width="600">
+  <img src="assets/cox_feature_computation.png" width="1000">
 </p>
 
 **Cox Features (from `./models/cox_features.pkl`):**
@@ -925,7 +925,7 @@ def get_model_loader() -> ModelLoader:
 
 ### 5.5 API Data Flow Diagram
 <p align="center">
-  <img src="assets/api_data_flow.png" width="600">
+  <img src="assets/api_data_flow.png" width="1000">
 </p>
 
 
