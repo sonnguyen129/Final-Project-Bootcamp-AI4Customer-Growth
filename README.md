@@ -491,11 +491,9 @@ Where:
 
 ```bash
 # Option 1: Using run_api.py
-cd /home/user/webapp
 python run_api.py --host 127.0.0.1 --port 8000
 
 # Option 2: Using uvicorn directly
-cd /home/user/webapp
 uvicorn src.api_service:app --host 127.0.0.1 --port 8000 --reload
 
 # Access API documentation
@@ -515,47 +513,9 @@ uvicorn src.api_service:app --host 127.0.0.1 --port 8000 --reload
 
 ### 5.1 Kiến trúc tổng quan
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Customer Churn & CLV API                            │
-│                         /home/user/webapp/run_api.py                        │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              FastAPI Application                            │
-│                         /home/user/webapp/src/api_service.py                │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                          Lifespan Handler                            │   │
-│  │  • Startup: Load models (ModelLoader) + Load data (DataProcessor)   │   │
-│  │  • Shutdown: Reset all singletons                                   │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                          CORS Middleware                             │   │
-│  │  • allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]    │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-          ┌───────────────────────────┼───────────────────────────┐
-          ▼                           ▼                           ▼
-┌──────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐
-│   ModelLoader    │     │    DataProcessor     │     │   ScoringEngine      │
-│   (Singleton)    │     │     (Singleton)      │     │   (Per-request)      │
-│                  │     │                      │     │                      │
-│ • BGF model      │     │ • customers.csv      │     │ • Churn prediction   │
-│ • GGF model      │     │ • transactions.csv   │     │ • Survival curves    │
-│ • Cox PH model   │     │ • Pre-computed feats │     │ • CLV estimation     │
-│ • Classification │     │ • On-the-fly feats   │     │ • Customer ranking   │
-│ • Preprocessing  │     │ • RFM computation    │     │                      │
-└──────────────────┘     └──────────────────────┘     └──────────────────────┘
-         │                         │                           │
-         └─────────────────────────┼───────────────────────────┘
-                                   ▼
-                    ┌──────────────────────────┐
-                    │   /home/user/webapp/     │
-                    │   models/ & data/        │
-                    └──────────────────────────┘
-```
+<p align="center">
+  <img src="assets/api_architecture.png" width="600">
+</p>
 
 ### 5.2 Chi tiết các Endpoints
 
@@ -608,7 +568,7 @@ uvicorn src.api_service:app --host 127.0.0.1 --port 8000 --reload
 
 **Mô tả:** Unified customer scoring - kết hợp tất cả các metrics trong một request.
 
-**File:** `/home/user/webapp/src/api_service.py` (line 176-221)
+**File:** `./src/api_service.py` (line 176-221)
 
 **Request Schema:** (`ScoreCustomerRequest`)
 ```json
@@ -630,40 +590,9 @@ uvicorn src.api_service:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 **Logic Flow:**
-```
-┌─────────────────┐
-│ score_customer  │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────────────┐
-│ Check customer exists   │
-│ (DataProcessor)         │
-└────────┬────────────────┘
-         │
-         ▼
-┌─────────────────────────┐     ┌─────────────────────┐
-│ is_customer_active()?   │──No─►│ Churned Customer    │
-│ (recency < 60 days)     │      │ • churn_prob = 1.0  │
-└────────┬────────────────┘      │ • Cox on-the-fly    │
-         │Yes                    └─────────────────────┘
-         ▼
-┌─────────────────────────┐
-│ Active Customer         │
-│ • Use pre-computed feats│
-│ • Classification model  │
-│ • Cox PH with features  │
-└─────────────────────────┘
-         │
-         ▼
-┌─────────────────────────┐
-│ BG-NBD & Gamma-Gamma    │
-│ • P(alive)              │
-│ • CLV computation       │
-│ (Works for ALL customers│
-│  with RFM features)     │
-└─────────────────────────┘
-```
+<p align="center">
+  <img src="assets/score_customer_logic_flow.png" width="600">
+</p>
 
 ---
 
@@ -671,7 +600,7 @@ uvicorn src.api_service:app --host 127.0.0.1 --port 8000 --reload
 
 **Mô tả:** Dự đoán xác suất churn với risk label.
 
-**File:** `/home/user/webapp/src/api_service.py` (line 224-261)
+**File:** `./src/api_service.py` (line 224-261)
 
 **Request Schema:** (`PredictChurnRequest`)
 ```json
@@ -709,7 +638,7 @@ churn_prob = min(1.0, churn_prob * (horizon_days / 60))
 
 **Mô tả:** Dự đoán survival curve và expected remaining lifetime.
 
-**File:** `/home/user/webapp/src/api_service.py` (line 264-301)
+**File:** `./src/api_service.py` (line 264-301)
 
 **Request Schema:** (`PredictSurvivalRequest`)
 ```json
@@ -734,51 +663,11 @@ churn_prob = min(1.0, churn_prob * (horizon_days / 60))
 ```
 
 **On-the-fly Cox Feature Computation:**
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    ON-THE-FLY COX FEATURE COMPUTATION                        │
-│                    (For ALL customers, not just active)                      │
-└─────────────────────────────────────────────────────────────────────────────┘
+<p align="center">
+  <img src="assets/cox_feature_computation.png" width="600">
+</p>
 
-┌─────────────────┐
-│ API Request     │
-│ predict_survival│
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────┐
-│ compute_cox_features_onthefly(customer_id)  │
-│ DataProcessor.py                             │
-│                                              │
-│ 1. Get customer transactions                 │
-│ 2. Compute RFM features from raw data        │
-│ 3. Build Cox feature DataFrame               │
-│    • recency, frequency, monetary            │
-│    • RFM_score, purchase_frequency_rate      │
-│    • recent_30d_frequency, frequency_trend   │
-│    • is_declining, cv_spending               │
-└─────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────┐
-│ Cox PH Prediction                            │
-│ ScoringEngine.py                             │
-│                                              │
-│ • cph.predict_survival_function(X_cox)      │
-│ • cph.predict_median(X_cox)                 │
-│ • Handle DataFrame/scalar return types       │
-└─────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────┐
-│ Result                                       │
-│ • survival_curve: [{day, prob}, ...]        │
-│ • expected_remaining_lifetime: float (days) │
-│ • NO fallback to default values             │
-└─────────────────────────────────────────────┘
-```
-
-**Cox Features (from `/home/user/webapp/models/cox_features.pkl`):**
+**Cox Features (from `./models/cox_features.pkl`):**
 - `recency`
 - `frequency`
 - `monetary`
@@ -795,7 +684,7 @@ churn_prob = min(1.0, churn_prob * (horizon_days / 60))
 
 **Mô tả:** Ước tính Customer Lifetime Value với 2 phương pháp.
 
-**File:** `/home/user/webapp/src/api_service.py` (line 304-345)
+**File:** `./src/api_service.py` 
 
 **Request Schema:** (`EstimateCLVRequest`)
 ```json
@@ -855,7 +744,7 @@ clv = expected_profit * monthly_purchases * avg_survival * discount_factor
 
 **Mô tả:** Xếp hạng khách hàng cho chiến dịch retention.
 
-**File:** `/home/user/webapp/src/api_service.py` (line 348-382)
+**File:** `./src/api_service.py` 
 
 **Request Schema:** (`RankCustomersRequest`)
 ```json
@@ -894,7 +783,7 @@ clv = expected_profit * monthly_purchases * avg_survival * discount_factor
 
 ### 5.3 Pydantic Models
 
-**File:** `/home/user/webapp/src/models.py`
+**File:** `./src/models.py`
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -939,7 +828,7 @@ clv = expected_profit * monthly_purchases * avg_survival * discount_factor
 
 ### 5.4 Core Modules
 
-#### 5.4.1 ScoringEngine (`/home/user/webapp/src/scoring_engine.py`)
+#### 5.4.1 ScoringEngine (`./src/scoring_engine.py`)
 
 **Class:** `ScoringEngine`
 
@@ -967,9 +856,7 @@ clv = expected_profit * monthly_purchases * avg_survival * discount_factor
 - `_calculate_survival_clv()` - Survival-based CLV
 - `_get_churn_label()` - Convert probability to risk label
 
-#### 5.4.2 DataProcessor (`/home/user/webapp/src/data_processor.py`)
-
-**File:** `/home/user/webapp/src/data_processor.py`
+#### 5.4.2 DataProcessor (`./src/data_processor.py`)
 
 **Default Configuration:**
 - `DEFAULT_DATA_DIR = 'data'`
@@ -1006,9 +893,7 @@ clv = expected_profit * monthly_purchases * avg_survival * discount_factor
 └─────────────────────┘     └─────────────────────────────────────────┘
 ```
 
-#### 5.4.3 ModelLoader (`/home/user/webapp/src/model_loader.py`)
-
-**File:** `/home/user/webapp/src/model_loader.py`
+#### 5.4.3 ModelLoader (`./src/model_loader.py`)
 
 **Models Loaded:**
 
@@ -1039,56 +924,10 @@ def get_model_loader() -> ModelLoader:
 ---
 
 ### 5.5 API Data Flow Diagram
+<p align="center">
+  <img src="assets/api_data_flow.png" width="600">
+</p>
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                              API REQUEST FLOW                                 │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-          Client Request                    Server Processing
-          ──────────────                    ─────────────────
-
-    ┌─────────────────┐
-    │ POST /endpoint  │
-    │ {"customer_id"} │
-    └────────┬────────┘
-             │
-             ▼
-    ┌─────────────────┐        ┌─────────────────────────────────────┐
-    │ FastAPI Router  │───────►│ Pydantic Validation                 │
-    │ (api_service.py)│        │ • ScoreCustomerRequest              │
-    └────────┬────────┘        │ • PredictChurnRequest, etc.         │
-             │                 └─────────────────────────────────────┘
-             ▼
-    ┌─────────────────┐        ┌─────────────────────────────────────┐
-    │ DataProcessor   │───────►│ Customer Validation                 │
-    │ (Singleton)     │        │ • processor.customer_exists()       │
-    └────────┬────────┘        │ • 404 if not found                  │
-             │                 └─────────────────────────────────────┘
-             ▼
-    ┌─────────────────┐        ┌─────────────────────────────────────┐
-    │ ScoringEngine   │───────►│ Feature Computation                 │
-    │ (Per-request)   │        │ • Pre-computed (active customers)   │
-    └────────┬────────┘        │ • On-the-fly (churned customers)    │
-             │                 └─────────────────────────────────────┘
-             ▼
-    ┌─────────────────┐        ┌─────────────────────────────────────┐
-    │ ModelLoader     │───────►│ Model Prediction                    │
-    │ (Singleton)     │        │ • BGF, GGF, Cox PH, Classification  │
-    └────────┬────────┘        └─────────────────────────────────────┘
-             │
-             ▼
-    ┌─────────────────┐        ┌─────────────────────────────────────┐
-    │ Response Model  │───────►│ Pydantic Serialization              │
-    │ (models.py)     │        │ • ScoreCustomerResponse, etc.       │
-    └────────┬────────┘        └─────────────────────────────────────┘
-             │
-             ▼
-    ┌─────────────────┐
-    │ JSON Response   │
-    │ HTTP 200/404/500│
-    └─────────────────┘
-```
 
 
 
